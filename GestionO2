@@ -1,0 +1,206 @@
+// Gestionnaire O2 : active les générateurs si réservoirs < 50%, désactive à 70%
+// Ignore les blocs de type "Système d'irrigation"
+// Ignore les réservoirs d'hydrogène
+// Détecte les ajouts/suppressions de blocs à chaque exécution
+// Défilement automatique du LCD si le contenu dépasse l'écran
+
+List<IMyGasGenerator> generators = new List<IMyGasGenerator>();
+List<IMyGasTank> oxygenTanks = new List<IMyGasTank>();
+IMyTextPanel lcd;
+
+const string NOM_LCD      = "LCD Oxygène";
+const float  SEUIL_BAS    = 0.50f;
+const float  SEUIL_HAUT   = 0.70f;
+const int    LIGNES_LCD   = 12;
+const int    TICKS_SCROLL = 3;
+
+int lastBlockCount   = -1;
+int scrollOffset     = 0;
+int ticksSinceScroll = 0;
+
+public Program()
+{
+    ScanBlocks();
+    Runtime.UpdateFrequency = UpdateFrequency.Update100;
+}
+
+public void Save() { }
+
+void ScanBlocks()
+{
+    generators.Clear();
+    oxygenTanks.Clear();
+
+    GridTerminalSystem.GetBlocksOfType(generators, g =>
+        g.IsSameConstructAs(Me) &&
+        !g.CustomName.ToLower().Contains("irrigation")
+    );
+
+    GridTerminalSystem.GetBlocksOfType(oxygenTanks, t =>
+        t.IsSameConstructAs(Me) &&
+        !t.CustomName.ToLower().Contains("hydrogène") &&
+        !t.CustomName.ToLower().Contains("hydrogen")
+    );
+
+    var block = GridTerminalSystem.GetBlockWithName(NOM_LCD);
+    if (block == null)
+    {
+        Echo($"Bloc '{NOM_LCD}' introuvable.");
+        lcd = null;
+    }
+    else if (!(block is IMyTextPanel))
+    {
+        Echo($"'{NOM_LCD}' trouvé mais ce n'est pas un LCD.");
+        lcd = null;
+    }
+    else
+    {
+        lcd = (IMyTextPanel)block;
+        lcd.ContentType = VRage.Game.GUI.TextPanel.ContentType.TEXT_AND_IMAGE;
+        lcd.Font        = "Monospace";
+        lcd.FontSize    = 1.0f;
+        lcd.TextPadding = 2.0f;
+        Echo($"LCD '{NOM_LCD}' connecté.");
+    }
+
+    var allBlocks = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocks(allBlocks);
+    lastBlockCount = allBlocks.Count;
+
+    Echo($"Scan — {allBlocks.Count} blocs | {generators.Count} gén. | {oxygenTanks.Count} rés. O2");
+}
+
+bool GridHasChanged()
+{
+    var allBlocks = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocks(allBlocks);
+    return allBlocks.Count != lastBlockCount;
+}
+
+void EcrireLCD(string texte)
+{
+    if (lcd == null) return;
+
+    try
+    {
+        string[] lignes = texte.Split('\n');
+        int totalLignes = lignes.Length;
+
+        if (totalLignes <= LIGNES_LCD)
+        {
+            scrollOffset     = 0;
+            ticksSinceScroll = 0;
+            lcd.WriteText(texte);
+            return;
+        }
+
+        ticksSinceScroll++;
+        if (ticksSinceScroll >= TICKS_SCROLL)
+        {
+            ticksSinceScroll = 0;
+            scrollOffset++;
+
+            if (scrollOffset + LIGNES_LCD > totalLignes)
+                scrollOffset = 0;
+        }
+
+        var fenetre = new System.Text.StringBuilder();
+        for (int i = scrollOffset; i < scrollOffset + LIGNES_LCD && i < totalLignes; i++)
+        {
+            fenetre.Append(lignes[i]);
+            if (i < scrollOffset + LIGNES_LCD - 1)
+                fenetre.Append('\n');
+        }
+
+        float progression = (float)scrollOffset / (totalLignes - LIGNES_LCD);
+        int   pos         = (int)(progression * 8);
+        string scrollbar  = $"[{new string('-', pos)}▼{new string('-', 8 - pos)}]";
+        fenetre.Append($"\n{scrollbar} {scrollOffset + 1}/{totalLignes - LIGNES_LCD + 1}");
+
+        lcd.WriteText(fenetre.ToString());
+    }
+    catch
+    {
+        Echo("Erreur d'écriture LCD — rescan au prochain tick.");
+        lcd            = null;
+        lastBlockCount = -1;
+    }
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if (GridHasChanged())
+    {
+        Echo("Changement détecté — Rescan en cours...");
+        ScanBlocks();
+    }
+
+    if (oxygenTanks.Count == 0)
+    {
+        Echo("Aucun réservoir O2 trouvé.");
+        EcrireLCD("Aucun réservoir O2\ntrouvé sur la grille.");
+        return;
+    }
+
+    // Calcul du niveau moyen (O2 uniquement)
+    float totalFilled = 0f;
+    foreach (var tank in oxygenTanks)
+        totalFilled += (float)tank.FilledRatio;
+
+    float avgLevel = totalFilled / oxygenTanks.Count;
+
+    // Logique hystérésis
+    bool shouldActivate;
+    if (avgLevel < SEUIL_BAS)
+        shouldActivate = true;
+    else if (avgLevel >= SEUIL_HAUT)
+        shouldActivate = false;
+    else
+        shouldActivate = generators.Count > 0 && generators[0].Enabled;
+
+    foreach (var gen in generators)
+        gen.Enabled = shouldActivate;
+
+    // Labels
+    string etat = shouldActivate ? "ACTIFS" : "INACTIFS";
+    string zone  = avgLevel < SEUIL_BAS   ? "SOUS SEUIL BAS"
+                 : avgLevel >= SEUIL_HAUT  ? "SEUIL HAUT ATTEINT"
+                 : "ZONE TAMPON";
+
+    // Echo debug
+    Echo($"O2     : {avgLevel * 100f:F1}%");
+    Echo($"Zone   : {zone}");
+    Echo($"Gén.   : {etat} ({generators.Count})");
+    Echo($"Rés.   : {oxygenTanks.Count} (H2 exclus)");
+    Echo($"LCD    : {(lcd != null ? "connecté" : "non trouvé")}");
+
+    // Construction du contenu
+    var contenu = new System.Text.StringBuilder();
+    contenu.Append("=== GESTION OXYGÈNE ===\n");
+    contenu.Append("\n");
+    contenu.Append($"Moyenne O2 : {avgLevel * 100f:F1}%\n");
+    contenu.Append($"[{BarreProgression(avgLevel)}]\n");
+    contenu.Append("\n");
+    contenu.Append($"État : {zone}\n");
+    contenu.Append($"Générateurs : {etat}\n");
+    contenu.Append("\n");
+    contenu.Append("-- Réservoirs O2 --\n");
+
+    foreach (var tank in oxygenTanks)
+    {
+        float pct      = (float)tank.FilledRatio * 100f;
+        float stockage = (float)(tank.FilledRatio * tank.Capacity);
+        string barre   = BarreProgression((float)tank.FilledRatio, 8);
+        contenu.Append($"{tank.CustomName}\n");
+        contenu.Append($"  [{barre}] {pct:F1}%\n");
+        contenu.Append($"  {stockage:F0} / {tank.Capacity:F0} L\n");
+    }
+
+    EcrireLCD(contenu.ToString());
+}
+
+string BarreProgression(float ratio, int largeur = 10)
+{
+    int rempli = (int)(ratio * largeur);
+    return new string('=', rempli) + new string('-', largeur - rempli);
+}
