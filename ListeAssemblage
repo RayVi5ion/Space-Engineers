@@ -1,0 +1,234 @@
+// Affichage de la file de production des assembleurs sur LCD
+// Détecte les ajouts/suppressions de blocs à chaque exécution
+// Défilement automatique si le contenu dépasse l'écran
+
+List<IMyAssembler> assemblers = new List<IMyAssembler>();
+IMyTextPanel lcd;
+
+const string NOM_LCD      = "LCD Assembleurs";
+const int    LIGNES_LCD   = 12;
+const int    TICKS_SCROLL = 3;
+
+int lastBlockCount   = -1;
+int scrollOffset     = 0;
+int ticksSinceScroll = 0;
+
+public Program()
+{
+    ScanBlocks();
+    Runtime.UpdateFrequency = UpdateFrequency.Update100;
+}
+
+public void Save() { }
+
+void ScanBlocks()
+{
+    assemblers.Clear();
+
+    GridTerminalSystem.GetBlocksOfType(assemblers, a => a.IsSameConstructAs(Me));
+
+    var block = GridTerminalSystem.GetBlockWithName(NOM_LCD);
+    if (block == null)
+    {
+        Echo($"Bloc '{NOM_LCD}' introuvable.");
+        lcd = null;
+    }
+    else if (!(block is IMyTextPanel))
+    {
+        Echo($"'{NOM_LCD}' trouvé mais ce n'est pas un LCD.");
+        lcd = null;
+    }
+    else
+    {
+        lcd = (IMyTextPanel)block;
+        lcd.ContentType = VRage.Game.GUI.TextPanel.ContentType.TEXT_AND_IMAGE;
+        lcd.Font        = "Monospace";
+        lcd.FontSize    = 1.0f;
+        lcd.TextPadding = 2.0f;
+        Echo($"LCD '{NOM_LCD}' connecté.");
+    }
+
+    var allBlocks = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocks(allBlocks);
+    lastBlockCount = allBlocks.Count;
+
+    Echo($"Scan — {allBlocks.Count} blocs | {assemblers.Count} assembleurs");
+}
+
+bool GridHasChanged()
+{
+    var allBlocks = new List<IMyTerminalBlock>();
+    GridTerminalSystem.GetBlocks(allBlocks);
+    return allBlocks.Count != lastBlockCount;
+}
+
+void EcrireLCD(string texte)
+{
+    if (lcd == null) return;
+
+    try
+    {
+        string[] lignes      = texte.Split('\n');
+        int      totalLignes = lignes.Length;
+
+        if (totalLignes <= LIGNES_LCD)
+        {
+            scrollOffset     = 0;
+            ticksSinceScroll = 0;
+            lcd.WriteText(texte);
+            return;
+        }
+
+        ticksSinceScroll++;
+        if (ticksSinceScroll >= TICKS_SCROLL)
+        {
+            ticksSinceScroll = 0;
+            scrollOffset++;
+
+            if (scrollOffset + LIGNES_LCD > totalLignes)
+                scrollOffset = 0;
+        }
+
+        var fenetre = new System.Text.StringBuilder();
+        for (int i = scrollOffset; i < scrollOffset + LIGNES_LCD && i < totalLignes; i++)
+        {
+            fenetre.Append(lignes[i]);
+            if (i < scrollOffset + LIGNES_LCD - 1)
+                fenetre.Append('\n');
+        }
+
+        float  progression = (float)scrollOffset / (totalLignes - LIGNES_LCD);
+        int    pos         = (int)(progression * 8);
+        string scrollbar   = $"[{new string('-', pos)}▼{new string('-', 8 - pos)}]";
+        fenetre.Append($"\n{scrollbar} {scrollOffset + 1}/{totalLignes - LIGNES_LCD + 1}");
+
+        lcd.WriteText(fenetre.ToString());
+    }
+    catch
+    {
+        Echo("Erreur d'écriture LCD — rescan au prochain tick.");
+        lcd            = null;
+        lastBlockCount = -1;
+    }
+}
+
+// Détermine le statut détaillé d'un assembleur
+string GetStatut(IMyAssembler assembler)
+{
+    // Bloc éteint
+    if (!assembler.Enabled)
+        return "[ OFF ]";
+
+    // Bloc allumé mais file vide
+    var file = new List<MyProductionItem>();
+    assembler.GetQueue(file);
+    if (file.Count == 0)
+        return "[ ON  ] En attente";
+
+    // Bloc allumé, en production
+    if (assembler.IsProducing)
+        return "[ ON  ] Production";
+
+    // Bloc allumé, file non vide, mais pas en production → en pause
+    // MyAssemblerMode est bien accessible en ingame contrairement à MyAssemblerStatus
+    if (assembler.Mode == MyAssemblerMode.Disassembly)
+        return "[ ON  ] Démontage en pause";
+
+    // Pause avec vérification des ressources manquantes via l'inventaire d'entrée
+    bool ressourcesManquantes = false;
+    try
+    {
+        var inventaire = assembler.InputInventory;
+        ressourcesManquantes = inventaire == null || inventaire.CurrentVolume == 0;
+    }
+    catch { }
+
+    return ressourcesManquantes
+        ? "[ ON  ] Ressources manquantes"
+        : "[ ON  ] En pause";
+}
+
+public void Main(string argument, UpdateType updateSource)
+{
+    if (GridHasChanged())
+    {
+        Echo("Changement détecté — Rescan en cours...");
+        ScanBlocks();
+    }
+
+    if (assemblers.Count == 0)
+    {
+        Echo("Aucun assembleur trouvé.");
+        EcrireLCD("Aucun assembleur\ntrouvé sur la grille.");
+        return;
+    }
+
+    var contenu    = new System.Text.StringBuilder();
+    int totalItems = 0;
+    bool fileVide  = true;
+
+    contenu.Append("=== FILE DE PRODUCTION ===\n");
+
+    foreach (var assembler in assemblers)
+    {
+        var file = new List<MyProductionItem>();
+        assembler.GetQueue(file);
+
+        // On affiche tous les assembleurs allumés, même sans file
+        if (!assembler.Enabled && file.Count == 0)
+            continue;
+
+        fileVide = false;
+
+        string statut = GetStatut(assembler);
+        contenu.Append($"\n{assembler.CustomName}\n");
+        contenu.Append($"  {statut}\n");
+
+        if (file.Count == 0)
+        {
+            contenu.Append("  (file vide)\n");
+            continue;
+        }
+
+        foreach (var item in file)
+        {
+            string nomPropre = NettoyerNom(item.BlueprintId.SubtypeName);
+            int    quantite  = (int)item.Amount;
+
+            contenu.Append($"  • {nomPropre}\n");
+            contenu.Append($"    Qté : {quantite}\n");
+            totalItems += quantite;
+        }
+    }
+
+    if (fileVide)
+    {
+        contenu.Append("\n  Aucune production\n  en cours.\n");
+    }
+    else
+    {
+        contenu.Append($"\n--------------------------\n");
+        contenu.Append($"Total en file : {totalItems}\n");
+    }
+
+    Echo($"Assembleurs : {assemblers.Count}");
+    Echo($"Total items : {totalItems}");
+    Echo($"LCD         : {(lcd != null ? "connecté" : "non trouvé")}");
+
+    EcrireLCD(contenu.ToString());
+}
+
+string NettoyerNom(string nom)
+{
+    if (string.IsNullOrEmpty(nom)) return "Inconnu";
+
+    var resultat = new System.Text.StringBuilder();
+    for (int i = 0; i < nom.Length; i++)
+    {
+        if (i > 0 && char.IsUpper(nom[i]) && !char.IsUpper(nom[i - 1]))
+            resultat.Append(' ');
+        resultat.Append(nom[i]);
+    }
+
+    return resultat.ToString();
+}
