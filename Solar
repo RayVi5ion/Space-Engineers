@@ -1,0 +1,501 @@
+// =============================================================================
+//   Script de suivi solaire avec gestion d'énergie
+//   - Alignement automatique des panneaux via rotors
+//   - Gestion réacteurs / batteries
+//   - Affichage LCD
+// =============================================================================
+
+// =============================================================================
+//  CONFIGURATION
+// =============================================================================
+
+const string NOM_GROUPE_ROTORS = "Solar Rotors";
+const string NOM_LCD           = "LCD Solaire";
+
+// Vitesses des rotors
+const float VITESSE_MIN_ROTOR = 0.05f; // RPM minimum
+const float VITESSE_MAX_ROTOR = 1.0f;  // RPM maximum
+
+// Seuil batterie en dessous duquel les réacteurs s'activent (en %)
+const float SEUIL_BATTERIE_BAS  = 30f;
+// Seuil batterie au-dessus duquel les réacteurs peuvent se désactiver (hystérésis)
+const float SEUIL_BATTERIE_HAUT = 40f;
+
+// Tolérance d'alignement : différence de production acceptée avant de considérer
+// les panneaux comme "alignés" (en % de la production maximale détectée)
+const float TOLERANCE_ALIGNEMENT = 1.5f;
+
+// Intervalle de scan des blocs (en ticks, 1 tick = ~100ms à Update10)
+const int INTERVALLE_SCAN = 100;
+
+// Nombre de ticks d'inertie avant de verrouiller la position du rotor
+const int TICKS_LOCK = 10;
+
+// =============================================================================
+//  FIN DE CONFIGURATION
+// =============================================================================
+
+// --- Blocs ---
+List<IMyMotorStator>  rotors    = new List<IMyMotorStator>();
+List<IMySolarPanel>   panneaux  = new List<IMySolarPanel>();
+List<IMyBatteryBlock> batteries = new List<IMyBatteryBlock>();
+List<IMyReactor>      reacteurs = new List<IMyReactor>();
+IMyTextPanel          lcd;
+
+// --- État de l'alignement par rotor ---
+class EtatRotor
+{
+    public IMyMotorStator Rotor;
+    public float          OutputLock      = 0f;  // production au moment du verrouillage
+    public float          OutputMax       = 0f;  // meilleure production détectée
+    public float          AngleMax        = 0f;  // angle correspondant à OutputMax
+    public int            Direction       = 1;   // sens de rotation (+1 / -1)
+    public int            TicksSansGain   = 0;   // ticks sans amélioration
+    public bool           Verrouille      = false;
+
+    public EtatRotor(IMyMotorStator r) { Rotor = r; }
+}
+
+List<EtatRotor> etatsRotors = new List<EtatRotor>();
+
+// --- Variables globales ---
+int    ticksScanRestants  = 0;
+int    scrollOffset       = 0;
+int    ticksScroll        = 0;
+const int TICKS_SCROLL    = 4;
+const int LIGNES_LCD      = 14;
+
+bool   reacteursActifs    = false; // état courant des réacteurs (logique hystérésis)
+
+public Program()
+{
+    ScanBlocs();
+    Runtime.UpdateFrequency = UpdateFrequency.Update10;
+}
+
+public void Save() { }
+
+// =============================================================================
+//  SCAN DES BLOCS
+// =============================================================================
+
+void ScanBlocs()
+{
+    rotors.Clear();
+    panneaux.Clear();
+    batteries.Clear();
+    reacteurs.Clear();
+    etatsRotors.Clear();
+
+    // Rotors depuis le groupe
+    var groupe = GridTerminalSystem.GetBlockGroupWithName(NOM_GROUPE_ROTORS);
+    if (groupe != null)
+    {
+        groupe.GetBlocksOfType(rotors, r => r.IsSameConstructAs(Me));
+        foreach (var r in rotors)
+            etatsRotors.Add(new EtatRotor(r));
+    }
+    else
+        Echo($"Groupe '{NOM_GROUPE_ROTORS}' introuvable !");
+
+    // Panneaux solaires sur toutes les sous-grilles des rotors
+    foreach (var er in etatsRotors)
+    {
+        var sousGrillePanneaux = new List<IMySolarPanel>();
+        GridTerminalSystem.GetBlocksOfType(sousGrillePanneaux,
+            p => p.CubeGrid == er.Rotor.TopGrid || p.IsSameConstructAs(Me));
+        foreach (var p in sousGrillePanneaux)
+            if (!panneaux.Contains(p)) panneaux.Add(p);
+    }
+    // Fallback : tous les panneaux du construct
+    if (panneaux.Count == 0)
+        GridTerminalSystem.GetBlocksOfType(panneaux, p => p.IsSameConstructAs(Me));
+
+    GridTerminalSystem.GetBlocksOfType(batteries, b => b.IsSameConstructAs(Me));
+    GridTerminalSystem.GetBlocksOfType(reacteurs,  r => r.IsSameConstructAs(Me));
+
+    // LCD
+    var bloc = GridTerminalSystem.GetBlockWithName(NOM_LCD);
+    if (bloc == null)
+    {
+        Echo($"LCD '{NOM_LCD}' introuvable !");
+        lcd = null;
+    }
+    else if (!(bloc is IMyTextPanel))
+    {
+        Echo($"'{NOM_LCD}' n'est pas un LCD !");
+        lcd = null;
+    }
+    else
+    {
+        lcd = (IMyTextPanel)bloc;
+        lcd.ContentType = VRage.Game.GUI.TextPanel.ContentType.TEXT_AND_IMAGE;
+        lcd.Font        = "Monospace";
+        lcd.FontSize    = 0.9f;
+        lcd.TextPadding = 2f;
+    }
+
+    Echo($"Scan : {rotors.Count} rotors | {panneaux.Count} panneaux | " +
+         $"{batteries.Count} batteries | {reacteurs.Count} réacteurs");
+}
+
+// =============================================================================
+//  MAIN
+// =============================================================================
+
+public void Main(string argument, UpdateType updateSource)
+{
+    // Rescan périodique
+    ticksScanRestants--;
+    if (ticksScanRestants <= 0)
+    {
+        ticksScanRestants = INTERVALLE_SCAN;
+        ScanBlocs();
+    }
+
+    // Calcul des métriques
+    float outputActuel  = 0f;
+    float outputMax     = 0f;
+    foreach (var p in panneaux)
+    {
+        outputActuel += p.CurrentOutput;
+        outputMax    += p.MaxOutput;
+    }
+    float efficacite = outputMax > 0f ? outputActuel / outputMax * 100f : 0f;
+
+    float batStockee  = 0f, batMax    = 0f;
+    float batInput    = 0f, batOutput = 0f;
+    foreach (var b in batteries)
+    {
+        batStockee  += b.CurrentStoredPower;
+        batMax      += b.MaxStoredPower;
+        batInput    += b.CurrentInput;
+        batOutput   += b.CurrentOutput;
+    }
+    float batPct = batMax > 0f ? batStockee / batMax * 100f : 0f;
+
+    float reacteurOutput = 0f;
+    float reacteurMax    = 0f;
+    foreach (var r in reacteurs)
+    {
+        reacteurOutput += r.CurrentOutput;
+        reacteurMax    += r.MaxOutput;
+    }
+
+    // --- Alignement des rotors ---
+    bool tousAlignes = AlignerRotors(outputActuel, outputMax);
+
+    // --- Gestion réacteurs ---
+    GererReacteurs(outputActuel, batPct, batInput, batOutput);
+
+    // --- Affichage LCD ---
+    AfficherLCD(
+        tousAlignes, efficacite, outputActuel, outputMax,
+        batPct, batStockee, batMax, batInput, batOutput,
+        reacteurOutput, reacteurMax
+    );
+
+    // --- Echo debug ---
+    Echo($"Panneaux  : {outputActuel * 1000f:F1} kW / {outputMax * 1000f:F1} kW ({efficacite:F1}%)");
+    Echo($"Batteries : {batPct:F1}%");
+    Echo($"Réacteurs : {(reacteursActifs ? "ACTIFS" : "INACTIFS")}");
+    Echo($"Aligné    : {(tousAlignes ? "OUI" : "NON")}");
+}
+
+// =============================================================================
+//  ALIGNEMENT DES ROTORS
+// =============================================================================
+
+bool AlignerRotors(float outputActuel, float outputMax)
+{
+    if (etatsRotors.Count == 0) return true;
+
+    int rotorsAlignes = 0;
+
+    foreach (var er in etatsRotors)
+    {
+        // Mise à jour du max détecté
+        if (outputActuel > er.OutputMax)
+        {
+            er.OutputMax   = outputActuel;
+            er.AngleMax    = er.Rotor.Angle;
+            er.TicksSansGain = 0;
+        }
+        else
+        {
+            er.TicksSansGain++;
+        }
+
+        // Si déjà verrouillé : vérifier si un réalignement est nécessaire
+        if (er.Verrouille)
+        {
+            float diff = Math.Abs(outputActuel - er.OutputLock);
+            float seuilRealign = er.OutputMax * (TOLERANCE_ALIGNEMENT / 100f);
+
+            if (diff > seuilRealign || outputActuel < er.OutputMax * 0.5f)
+            {
+                // Déverrouiller et reprendre la recherche
+                er.Verrouille    = false;
+                er.OutputMax     = outputActuel;
+                er.TicksSansGain = 0;
+            }
+            else
+            {
+                // Verrouillé et stable → arrêt du rotor
+                er.Rotor.TargetVelocityRPM = 0f;
+                er.Rotor.RotorLock         = true;
+                rotorsAlignes++;
+                continue;
+            }
+        }
+
+        // Recherche du meilleur angle par rotation continue
+        float vitesse = CalculerVitesse(outputActuel, er.OutputMax);
+        er.Rotor.RotorLock         = false;
+        er.Rotor.TargetVelocityRPM = vitesse * er.Direction;
+
+        // Si plus de gain depuis TICKS_LOCK ticks → inverser ou verrouiller
+        if (er.TicksSansGain >= TICKS_LOCK)
+        {
+            if (outputActuel >= er.OutputMax * (1f - TOLERANCE_ALIGNEMENT / 100f))
+            {
+                // On est au pic → verrouiller
+                er.Rotor.TargetVelocityRPM = 0f;
+                er.Rotor.RotorLock         = true;
+                er.OutputLock              = outputActuel;
+                er.Verrouille              = true;
+                rotorsAlignes++;
+            }
+            else
+            {
+                // Pas au pic → inverser le sens
+                er.Direction     *= -1;
+                er.TicksSansGain  = 0;
+                er.OutputMax      = outputActuel;
+            }
+        }
+    }
+
+    return rotorsAlignes == etatsRotors.Count;
+}
+
+// Calcule la vitesse du rotor en fonction de l'écart par rapport au max détecté
+float CalculerVitesse(float outputActuel, float outputMax)
+{
+    if (outputMax <= 0f) return VITESSE_MAX_ROTOR;
+    float ratio   = outputActuel / outputMax;
+    // Plus on est près du max, plus on ralentit
+    float vitesse = VITESSE_MAX_ROTOR - (VITESSE_MAX_ROTOR - VITESSE_MIN_ROTOR) * ratio;
+    return Math.Max(vitesse, VITESSE_MIN_ROTOR);
+}
+
+// =============================================================================
+//  GESTION DES RÉACTEURS
+// =============================================================================
+
+void GererReacteurs(float outputSolaire, float batPct, float batInput, float batOutput)
+{
+    if (reacteurs.Count == 0) return;
+
+    // Calcul de la consommation totale estimée de la grille
+    // = ce que les batteries fournissent en décharge + production solaire
+    // Si batteries en charge, elles consomment → leur input s'ajoute à la demande
+    float apportTotal = outputSolaire + batOutput;
+    float demandeTotal = apportTotal + batInput; // approximation de la charge totale
+
+    // Logique hystérésis
+    bool doitActiver = false;
+
+    if (batPct < SEUIL_BATTERIE_BAS)
+        doitActiver = true;                       // batteries trop basses → on active
+    else if (batPct > SEUIL_BATTERIE_HAUT && reacteursActifs)
+        doitActiver = false;                      // batteries rechargées → on peut couper
+    else
+        doitActiver = reacteursActifs;            // zone tampon → on maintient l'état actuel
+
+    // Vérification surcharge : si panneaux + batteries ne suffisent pas
+    // (batteries en décharge rapide malgré les panneaux)
+    if (batInput == 0f && batOutput > outputSolaire * 0.5f)
+        doitActiver = true;
+
+    reacteursActifs = doitActiver;
+    foreach (var r in reacteurs)
+        r.Enabled = reacteursActifs;
+}
+
+// =============================================================================
+//  AFFICHAGE LCD
+// =============================================================================
+
+void AfficherLCD(
+    bool    tousAlignes,
+    float   efficacite,
+    float   outputActuel,
+    float   outputMax,
+    float   batPct,
+    float   batStockee,
+    float   batMax,
+    float   batInput,
+    float   batOutput,
+    float   reacteurOutput,
+    float   reacteurMax)
+{
+    if (lcd == null) return;
+
+    var contenu = new System.Text.StringBuilder();
+
+    // En-tête
+    contenu.Append("=== GESTION SOLAIRE ===\n\n");
+
+    // --- Panneaux solaires ---
+    string etatAlign = tousAlignes ? "✓ ALIGNÉS" : "~ ALIGNEMENT...";
+    contenu.Append($"PANNEAUX SOLAIRES\n");
+    contenu.Append($"  État      : {etatAlign}\n");
+    contenu.Append($"  Efficacité: {efficacite:F1}%\n");
+    contenu.Append($"  [{BarreProgression(efficacite / 100f)}]\n");
+    contenu.Append($"  Production: {FormatPuissance(outputActuel)}\n");
+    contenu.Append($"  Max détecté: {FormatPuissance(outputMax)}\n");
+    contenu.Append($"  Rotors    : {etatsRotors.Count}\n");
+    contenu.Append("\n");
+
+    // --- Batteries ---
+    contenu.Append("BATTERIES\n");
+    if (batteries.Count == 0)
+    {
+        contenu.Append("  Aucune batterie détectée.\n");
+    }
+    else
+    {
+        string statutBat = batPct < SEUIL_BATTERIE_BAS  ? "⚠ FAIBLE"
+                         : batPct > SEUIL_BATTERIE_HAUT ? "✓ OK"
+                         : "~ TAMPON";
+        contenu.Append($"  Charge    : {batPct:F1}%  {statutBat}\n");
+        contenu.Append($"  [{BarreProgression(batPct / 100f)}]\n");
+        contenu.Append($"  Stocké    : {FormatEnergie(batStockee)} / {FormatEnergie(batMax)}\n");
+        contenu.Append($"  Entrée    : {FormatPuissance(batInput)}\n");
+        contenu.Append($"  Sortie    : {FormatPuissance(batOutput)}\n");
+
+        // Détail de chaque batterie
+        contenu.Append("\n  -- Détail --\n");
+        foreach (var b in batteries)
+        {
+            float pct   = b.MaxStoredPower > 0f ? b.CurrentStoredPower / b.MaxStoredPower * 100f : 0f;
+            string mode = b.CurrentInput > b.CurrentOutput ? "⟳ Charge"
+                        : b.CurrentStoredPower < b.MaxStoredPower * 0.99f ? "↓ Décharge"
+                        : "= Pleine";
+            contenu.Append($"  {b.CustomName}\n");
+            contenu.Append($"    [{BarreProgression(pct / 100f, 6)}] {pct:F0}% {mode}\n");
+        }
+    }
+    contenu.Append("\n");
+
+    // --- Réacteurs ---
+    contenu.Append("RÉACTEURS\n");
+    if (reacteurs.Count == 0)
+    {
+        contenu.Append("  Aucun réacteur détecté.\n");
+    }
+    else
+    {
+        string statutReact = reacteursActifs ? "ACTIFS" : "○ INACTIFS";
+        string raisonReact = reacteursActifs
+            ? (batteries.Count > 0 && batteries[0].CurrentStoredPower / Math.Max(batteries[0].MaxStoredPower, 1f) * 100f < SEUIL_BATTERIE_BAS
+                ? "Batteries faibles"
+                : "Apport insuffisant")
+            : "Énergie suffisante";
+        contenu.Append($"  État      : {statutReact}\n");
+        contenu.Append($"  Raison    : {raisonReact}\n");
+        contenu.Append($"  Production: {FormatPuissance(reacteurOutput)} / {FormatPuissance(reacteurMax)}\n");
+
+        // Détail de chaque réacteur
+        contenu.Append("\n  -- Détail --\n");
+        foreach (var r in reacteurs)
+        {
+            string etatR = r.Enabled ? $"{FormatPuissance(r.CurrentOutput)}" : "○ OFF";
+            contenu.Append($"  {r.CustomName}\n");
+            contenu.Append($"    {etatR}\n");
+        }
+    }
+    contenu.Append("\n");
+
+    // --- Seuils de référence ---
+    contenu.Append("SEUILS\n");
+    contenu.Append($"  Activation  : < {SEUIL_BATTERIE_BAS:F0}% batterie\n");
+    contenu.Append($"  Désactivation: > {SEUIL_BATTERIE_HAUT:F0}% batterie\n");
+
+    EcrireLCD(contenu.ToString());
+}
+
+// =============================================================================
+//  UTILITAIRES
+// =============================================================================
+
+void EcrireLCD(string texte)
+{
+    if (lcd == null) return;
+    try
+    {
+        string[] lignes     = texte.Split('\n');
+        int      totalLignes = lignes.Length;
+
+        if (totalLignes <= LIGNES_LCD)
+        {
+            scrollOffset = 0;
+            ticksScroll  = 0;
+            lcd.WriteText(texte);
+            return;
+        }
+
+        ticksScroll++;
+        if (ticksScroll >= TICKS_SCROLL)
+        {
+            ticksScroll = 0;
+            scrollOffset++;
+            if (scrollOffset + LIGNES_LCD > totalLignes)
+                scrollOffset = 0;
+        }
+
+        var fenetre = new System.Text.StringBuilder();
+        for (int i = scrollOffset; i < scrollOffset + LIGNES_LCD && i < totalLignes; i++)
+        {
+            fenetre.Append(lignes[i]);
+            if (i < scrollOffset + LIGNES_LCD - 1)
+                fenetre.Append('\n');
+        }
+
+        float  prog      = (float)scrollOffset / Math.Max(totalLignes - LIGNES_LCD, 1);
+        int    pos       = (int)(prog * 8);
+        string scrollbar = $"[{new string('-', pos)}▼{new string('-', 8 - pos)}]";
+        fenetre.Append($"\n{scrollbar} {scrollOffset + 1}/{totalLignes - LIGNES_LCD + 1}");
+
+        lcd.WriteText(fenetre.ToString());
+    }
+    catch
+    {
+        Echo("Erreur écriture LCD.");
+        lcd            = null;
+        ticksScanRestants = 0;
+    }
+}
+
+string BarreProgression(float ratio, int largeur = 8)
+{
+    ratio = Math.Max(0f, Math.Min(1f, ratio));
+    int rempli = (int)(ratio * largeur);
+    return new string('█', rempli) + new string('░', largeur - rempli);
+}
+
+string FormatPuissance(float mw)
+{
+    if (mw < 0.001f) return "0 W";
+    if (mw < 1f)     return $"{mw * 1000f:F1} kW";
+    if (mw < 1000f)  return $"{mw:F2} MW";
+    return $"{mw / 1000f:F2} GW";
+}
+
+string FormatEnergie(float mwh)
+{
+    if (mwh < 1f)    return $"{mwh * 1000f:F1} kWh";
+    if (mwh < 1000f) return $"{mwh:F2} MWh";
+    return $"{mwh / 1000f:F2} GWh";
+}
